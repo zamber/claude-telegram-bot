@@ -25,6 +25,8 @@ import {
   handleCallback,
 } from "./handlers";
 import { keyForCtx } from "./ext/session-manager";
+import { handleRun, handleScripts, handleHelp, registerBotMenu } from "./ext/commands";
+import { fileRunMiddleware } from "./ext/file-run-intercept";
 import { threadContextMiddleware, installThreadApiTransformer } from "./ext/thread-routing";
 
 // Create bot instance
@@ -68,6 +70,15 @@ bot.command("status", handleStatus);
 bot.command("resume", handleResume);
 bot.command("restart", handleRestart);
 bot.command("retry", handleRetry);
+bot.command("run", handleRun);
+bot.command("scripts", handleScripts);
+bot.command("help", handleHelp);
+
+// ============== File-attachment /run interceptor ==============
+// Must run before the message-type handlers below: on a caption match it
+// handles the update itself and does not call next(); otherwise it's a
+// no-op passthrough, so normal attachment uploads are unaffected.
+bot.use(fileRunMiddleware);
 
 // ============== Message Handlers ==============
 
@@ -112,6 +123,9 @@ console.log("Starting bot...");
 // Get bot info first
 const botInfo = await bot.api.getMe();
 console.log(`Bot started: @${botInfo.username}`);
+
+// Register the "/" command menu shown in the Telegram client
+await registerBotMenu(bot);
 
 // Check for pending restart message to update
 if (existsSync(RESTART_FILE)) {

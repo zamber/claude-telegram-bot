@@ -49,7 +49,7 @@ Each message type has a dedicated async handler:
 
 Self-contained additions kept out of the files above so upstream (`linuz90/claude-telegram-bot`)
 rebases stay clean - the only touches outside this directory are the small additive diffs noted
-in `session.ts`, `types.ts`, and `index.ts`'s middleware registration.
+in `session.ts`, `types.ts`, and `index.ts`'s command/middleware registration.
 
 - **`session-manager.ts`** - `getSession(ctx)` routes each Telegram forum topic
   (`message_thread_id`) to its own `ClaudeSession` instance; messages outside a topic keep using
@@ -58,7 +58,14 @@ in `session.ts`, `types.ts`, and `index.ts`'s middleware registration.
   carry the correct `message_thread_id` (AsyncLocalStorage + a raw API transformer). Needed
   because grammY's own `ctx.reply()`/etc. shortcuts only attach it when Telegram's
   `is_topic_message` flag happens to be set, which isn't reliable enough on its own.
-- Tests: `bun test` (colocated `*.test.ts` files).
+- **`scripts.ts`** + **`scripts.config.ts`** (gitignored, see `scripts.config.example.ts`) - the
+  `/run <script> [args...]` whitelisted runner for `~/.bin/,*.sh` automation scripts. Opt-in
+  allowlist only; see `SECURITY.md`'s Layer 6.
+- **`commands.ts`** - `/run`, `/scripts`, `/help`, and `registerBotMenu()` (`setMyCommands`).
+- **`file-run-intercept.ts`** + **`download.ts`** - lets a script be invoked by attaching a file
+  with a caption like `/run transcribe {file}`, without touching `document.ts`/`photo.ts`/etc.
+- Tests: `bun test` (colocated `*.test.ts` files, plus `__fixtures__/*.sh` shell fixtures for
+  `scripts.ts`).
 
 ### Security Layers
 

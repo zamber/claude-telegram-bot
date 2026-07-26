@@ -125,7 +125,21 @@ Claude receives a safety prompt that instructs it to:
 
 This is the primary protection layer. The other layers are defense-in-depth.
 
-### Layer 6: Audit Logging
+### Layer 6: Script Allowlist (`/run`)
+
+`/run <script> [args...]` (src/ext/, see src/ext/scripts.config.example.ts) invokes scripts
+from an explicit, opt-in allowlist - nothing is runnable by default. Two things make this
+different from the layers above:
+
+- Arguments are passed as an argv array (never a shell string), so their content is never
+  shell-interpreted, but they are otherwise trusted the same way any other authorized-user
+  action is trusted under this bot's threat model.
+- Script *output* is relayed back into the Telegram chat, which means a script that prints a
+  secret (e.g. a credential, a session token) would leak it there. This is why the allowlist is
+  opt-in rather than auto-discovering everything in `~/.bin/`: only add a script after checking
+  what it prints.
+
+### Layer 7: Audit Logging
 
 All interactions are logged for security review.
 
