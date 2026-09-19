@@ -186,6 +186,30 @@ export const THINKING_DEEP_KEYWORDS = thinkingDeepKeywordsStr
   .split(",")
   .map((k) => k.trim().toLowerCase());
 
+// ============== Forum Topic Auto-Rename ==============
+
+// When a new Claude session is created inside a Telegram forum topic, rename
+// the topic to Claude's auto-generated session name (read from the session
+// JSONL's `slug`). Only applies to forum topics (message_thread_id present)
+// and requires the bot to have can_manage_topics rights. Failures are logged,
+// never fatal.
+export const AUTO_RENAME_TOPICS =
+  (process.env.AUTO_RENAME_TOPICS ?? "true").toLowerCase() === "true";
+
+// ============== Tool Permission Prompts ==============
+
+// When true, tools that fall outside the bot's own allowlist are approved or
+// denied by the user through an inline keyboard instead of being hard-failed
+// by the post-hoc guard in session.ts (see src/ext/permissions.ts).
+export const PERMISSION_PROMPTS =
+  (process.env.PERMISSION_PROMPTS ?? "true").toLowerCase() === "true";
+
+// How long an unanswered permission prompt stays pending before it is denied.
+export const PERMISSION_TIMEOUT_MS = parseInt(
+  process.env.PERMISSION_TIMEOUT_MS || "600000",
+  10
+);
+
 // ============== Media Group Settings ==============
 
 export const MEDIA_GROUP_TIMEOUT = 1000; // ms to wait for more photos in a group
@@ -220,6 +244,11 @@ export const RATE_LIMIT_WINDOW = parseInt(
 // ============== File Paths ==============
 
 export const SESSION_FILE = "/tmp/claude-telegram-session.json";
+// Persistent "thread key → current Claude session id" binding, kept in sync
+// with SESSION_FILE so the first message after a service restart resumes the
+// right session instead of starting fresh (see src/ext/session-map.ts).
+export const SESSION_MAP_FILE =
+  process.env.SESSION_MAP_FILE || "/tmp/claude-telegram-session-map.json";
 export const RESTART_FILE = "/tmp/claude-telegram-restart.json";
 export const TEMP_DIR = "/tmp/telegram-bot";
 

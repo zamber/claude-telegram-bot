@@ -54,6 +54,11 @@ in `session.ts`, `types.ts`, and `index.ts`'s command/middleware registration.
 - **`session-manager.ts`** - `getSession(ctx)` routes each Telegram forum topic
   (`message_thread_id`) to its own `ClaudeSession` instance; messages outside a topic keep using
   the single pre-existing `"default"` session, unchanged.
+- **`session-map.ts`** - persists the "thread key → current Claude session id" binding to
+  `/tmp/claude-telegram-session-map.json`. The runtime instance Map above is lost on service
+  restart; this on-disk map lets `ClaudeSession.restorePersistedSession()` resume the right
+  session for a thread on the first message after a restart. Backfills once from the session
+  history on first run so existing topics survive the upgrade too.
 - **`thread-routing.ts`** - forces every outgoing Bot API call for the update being processed to
   carry the correct `message_thread_id` (AsyncLocalStorage + a raw API transformer). Needed
   because grammY's own `ctx.reply()`/etc. shortcuts only attach it when Telegram's

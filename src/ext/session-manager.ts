@@ -9,6 +9,12 @@
  * topic) always maps to the literal key "default" — this is what makes the
  * change non-disruptive to the bot's existing single-session behavior and to
  * the session history already saved in /tmp/claude-telegram-session.json.
+ *
+ * The Map below caches ClaudeSession instances for the life of the process.
+ * It does NOT persist across a service restart — the "which session id is
+ * bound to which thread key" state lives in src/ext/session-map.ts, which
+ * session.ts reads/writes so the first message after a restart resumes the
+ * right session (see ClaudeSession.restorePersistedSession).
  */
 
 import type { Context } from "grammy";
