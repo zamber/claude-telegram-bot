@@ -7,6 +7,12 @@
 import type { Context } from "grammy";
 import { unlinkSync } from "fs";
 import { getSession } from "../ext/session-manager";
+import { renameTopicToSessionTitle } from "../ext/session-title";
+import {
+  DECISION_CODES,
+  PERMISSION_CALLBACK_PREFIX,
+  resolvePermission,
+} from "../ext/permissions";
 import { ALLOWED_USERS } from "../config";
 import { isAuthorized } from "../security";
 import { auditLog, startTypingIndicator } from "../utils";
@@ -39,7 +45,42 @@ export async function handleCallback(ctx: Context): Promise<void> {
     return;
   }
 
-  // 3. Parse callback data: askuser:{request_id}:{option_index}
+  // 3. Handle tool-permission callbacks: perm:{request_id}:{a|w|d}
+  // The pending request already edits its own message on settle, so this
+  // branch only has to settle the SDK promise and acknowledge the tap.
+  if (callbackData.startsWith(PERMISSION_CALLBACK_PREFIX)) {
+    const permParts = callbackData.split(":");
+    const requestId = permParts[1];
+    const code = permParts[2];
+    const decision = code ? DECISION_CODES[code] : undefined;
+
+    if (!requestId || !decision) {
+      await ctx.answerCallbackQuery({ text: "Invalid permission callback" });
+      return;
+    }
+
+    const resolved = resolvePermission(requestId, decision);
+    if (!resolved) {
+      await ctx.answerCallbackQuery({
+        text: "This request expired.",
+        show_alert: true,
+      });
+      return;
+    }
+
+    const label =
+      decision === "deny"
+        ? "Denied"
+        : decision === "always"
+          ? "Always allowed"
+          : "Allowed";
+    await ctx.answerCallbackQuery({
+      text: `${label}: ${resolved.toolName}`,
+    });
+    return;
+  }
+
+  // 4. Parse callback data: askuser:{request_id}:{option_index}
   if (!callbackData.startsWith("askuser:")) {
     await ctx.answerCallbackQuery();
     return;
@@ -215,5 +256,16 @@ async function handleResumeCallback(
     // Don't show error to user - session is still resumed, recap just failed
   } finally {
     typing.stop();
+  }
+
+  // Rename the forum topic to match the resumed session (best-effort). The
+  // topic's session binding changed here, so a rename is warranted even though
+  // no text message went through handleText.
+  if (session.sessionId) {
+    await renameTopicToSessionTitle(
+      ctx,
+      session.sessionId,
+      session.conversationTitle
+    );
   }
 }
