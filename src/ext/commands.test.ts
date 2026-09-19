@@ -1,13 +1,13 @@
 import { describe, test, expect } from "bun:test";
 import { resolve } from "path";
 import type { Context } from "grammy";
-import { buildCommandMenu, replyWithScriptResult } from "./commands";
+import { buildMenuEntries, replyWithScriptResult } from "./commands";
 import type { ScriptDef } from "./scripts";
 
 const FIXTURES = resolve(import.meta.dir, "__fixtures__");
 
-describe("buildCommandMenu", () => {
-  const menu = buildCommandMenu();
+describe("buildMenuEntries", () => {
+  const menu = buildMenuEntries();
 
   test("includes the existing native commands", () => {
     const names = menu.map((e) => e.command);
@@ -16,9 +16,11 @@ describe("buildCommandMenu", () => {
     );
   });
 
-  test("includes the new script-runner commands", () => {
+  test("includes the new script-runner and plan-mode commands", () => {
     const names = menu.map((e) => e.command);
-    expect(names).toEqual(expect.arrayContaining(["run", "scripts", "help"]));
+    expect(names).toEqual(
+      expect.arrayContaining(["run", "scripts", "plan", "build", "help"])
+    );
   });
 
   test("every entry has a non-empty description (required by setMyCommands)", () => {

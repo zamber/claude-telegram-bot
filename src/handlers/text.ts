@@ -13,6 +13,8 @@ import {
   startTypingIndicator,
 } from "../utils";
 import { StreamingState, createStatusCallback } from "./streaming";
+import { translateMenuCommand } from "../ext/claude-commands";
+import { renameTopicToSessionTitle } from "../ext/session-title";
 
 /**
  * Handle incoming text messages.
@@ -40,6 +42,17 @@ export async function handleText(ctx: Context): Promise<void> {
     return;
   }
 
+  // Translate a sanitized menu command back to the real Claude command/skill
+  // name (e.g. /mattpocock_skills -> /mattpocock-skills). Bot commands like
+  // /plan never reach here — grammY routes them to their own handlers.
+  if (message.startsWith("/")) {
+    const [first, ...rest] = message.slice(1).split(" ");
+    const real = translateMenuCommand(first!);
+    if (real !== first) {
+      message = `/${real}${rest.length ? " " + rest.join(" ") : ""}`;
+    }
+  }
+
   // 3. Rate limit check
   const [allowed, retryAfter] = rateLimiter.check(userId);
   if (!allowed) {
@@ -54,7 +67,9 @@ export async function handleText(ctx: Context): Promise<void> {
   session.lastMessage = message;
 
   // 5. Set conversation title from first message (if new session)
-  if (!session.isActive) {
+  const prevSessionId = session.sessionId;
+  const wasNew = !session.isActive;
+  if (wasNew) {
     // Truncate title to ~50 chars
     const title =
       message.length > 50 ? message.slice(0, 47) + "..." : message;
@@ -73,6 +88,7 @@ export async function handleText(ctx: Context): Promise<void> {
 
   // 9. Send to Claude with retry logic for crashes
   const MAX_RETRIES = 1;
+  let querySucceeded = false;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
@@ -87,6 +103,7 @@ export async function handleText(ctx: Context): Promise<void> {
 
       // 10. Audit log
       await auditLog(userId, username, "TEXT", message, response);
+      querySucceeded = true;
       break; // Success - exit retry loop
     } catch (error) {
       const errorStr = String(error);
@@ -104,10 +121,10 @@ export async function handleText(ctx: Context): Promise<void> {
       // Retry on Claude Code crash (not user cancellation)
       if (isClaudeCodeCrash && attempt < MAX_RETRIES) {
         console.log(
-          `Claude Code crashed, retrying (attempt ${attempt + 2}/${MAX_RETRIES + 1})...`
+          `[TextHandler] Claude Code crashed (${errorStr.slice(0, 100)}), retrying (attempt ${attempt + 2}/${MAX_RETRIES + 1})...`
         );
-        await session.kill(); // Clear corrupted session
-        await ctx.reply(`⚠️ Claude crashed, retrying...`);
+        await session.kill(); // Clear corrupted session - NOTE: This clears sessionId but keeps the session instance in the Map
+        await ctx.reply(`⚠️ Claude crashed (session reset), retrying...`);
         // Reset state for retry
         state = new StreamingState();
         statusCallback = createStatusCallback(ctx, state);
@@ -129,6 +146,19 @@ export async function handleText(ctx: Context): Promise<void> {
       }
       break; // Exit loop after handling error
     }
+  }
+
+  // 10.5 Forum-topic auto-rename: rename the topic whenever the session bound
+  // to it changed during this message — a brand-new session, a crash-retry that
+  // spawned a fresh session, or an auto-restore after a service restart.
+  // Comparing the session id (rather than `wasNew`) also covers the case where
+  // the topic's session changes while the topic is already active.
+  if (querySucceeded && session.sessionId && session.sessionId !== prevSessionId) {
+    await renameTopicToSessionTitle(
+      ctx,
+      session.sessionId,
+      session.conversationTitle
+    );
   }
 
   // 11. Cleanup

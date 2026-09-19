@@ -25,12 +25,25 @@ import {
   handleCallback,
 } from "./handlers";
 import { keyForCtx } from "./ext/session-manager";
-import { handleRun, handleScripts, handleHelp, registerBotMenu } from "./ext/commands";
+import {
+  handleRun,
+  handleScripts,
+  handleHelp,
+  handlePlan,
+  handleBuild,
+  registerBotMenu,
+} from "./ext/commands";
+import { setOnClaudeCommandsChanged } from "./ext/claude-commands";
 import { fileRunMiddleware } from "./ext/file-run-intercept";
 import { threadContextMiddleware, installThreadApiTransformer } from "./ext/thread-routing";
+import { setPermissionApi } from "./ext/permissions";
 
 // Create bot instance
 const bot = new Bot(TELEGRAM_TOKEN);
+
+// Let the permission module post its approve/deny keyboards without importing
+// the bot (which would be a cycle: session.ts -> permissions.ts -> index.ts).
+setPermissionApi(bot.api);
 
 // Force every outgoing reply/typing-indicator/etc. for this update to carry
 // the correct message_thread_id, instead of relying on grammY's shortcuts
@@ -72,6 +85,8 @@ bot.command("restart", handleRestart);
 bot.command("retry", handleRetry);
 bot.command("run", handleRun);
 bot.command("scripts", handleScripts);
+bot.command("plan", handlePlan);
+bot.command("build", handleBuild);
 bot.command("help", handleHelp);
 
 // ============== File-attachment /run interceptor ==============
@@ -126,6 +141,18 @@ console.log(`Bot started: @${botInfo.username}`);
 
 // Register the "/" command menu shown in the Telegram client
 await registerBotMenu(bot);
+
+// When Claude reports a new slash-command/skill set (from an SDK init
+// message), refresh the Telegram "/" menu so it stays in sync. Fire-and-forget
+// inside the event loop; errors are logged, never fatal.
+setOnClaudeCommandsChanged(async () => {
+  try {
+    await registerBotMenu(bot);
+    console.log("Refreshed Telegram command menu from harvested Claude commands");
+  } catch (e) {
+    console.warn("Failed to refresh Telegram command menu:", e);
+  }
+});
 
 // Check for pending restart message to update
 if (existsSync(RESTART_FILE)) {

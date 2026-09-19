@@ -10,36 +10,35 @@ import { ALLOWED_USERS } from "../config";
 import { isAuthorized, rateLimiter } from "../security";
 import { escapeHtml } from "../formatting";
 import { SCRIPTS, findScript, tokenizeArgs, runScript, type ScriptDef } from "./scripts";
+import { getSession } from "./session-manager";
+import { buildCommandMenu, getClaudeCommandNames } from "./claude-commands";
+import { resolvePendingPlanExit } from "./permissions";
 
-export interface MenuEntry {
-  command: string;
-  description: string;
-}
-
-const NATIVE_COMMANDS: MenuEntry[] = [
-  { command: "new", description: "Start a fresh Claude session" },
-  { command: "stop", description: "Stop the current query" },
-  { command: "status", description: "Show detailed status" },
-  { command: "resume", description: "Resume a previous session" },
-  { command: "retry", description: "Retry the last message" },
-  { command: "restart", description: "Restart the bot" },
-];
+export type { MenuEntry } from "./claude-commands";
 
 /**
- * Pure function: native commands + run/scripts/help, in one place so
- * /help and the Telegram "/" menu can't drift out of sync.
+ * Turn plan mode off for this session and, if the CLI is currently waiting on
+ * an ExitPlanMode approval, settle that request as an approval too. Without
+ * the second half the bot-side flag flips while the CLI session stays in plan
+ * mode — the exact deadlock that made /build look broken.
  */
-export function buildCommandMenu(): MenuEntry[] {
-  return [
-    ...NATIVE_COMMANDS,
-    { command: "run", description: "Run a whitelisted ~/.bin script" },
-    { command: "scripts", description: "List runnable scripts" },
-    { command: "help", description: "Show this help" },
-  ];
+function exitPlanMode(ctx: Context): boolean {
+  const session = getSession(ctx);
+  session.setPlanMode(false);
+  return resolvePendingPlanExit(session.sessionKey);
+}
+
+/**
+ * The Telegram "/" menu = native bot commands + harvested Claude
+ * slash-commands/skills (see src/ext/claude-commands.ts). Single source of
+ * truth for both /help and setMyCommands so they can't drift apart.
+ */
+export function buildMenuEntries(): ReturnType<typeof buildCommandMenu> {
+  return buildCommandMenu(getClaudeCommandNames());
 }
 
 export async function registerBotMenu(bot: Bot): Promise<void> {
-  await bot.api.setMyCommands(buildCommandMenu());
+  await bot.api.setMyCommands(buildMenuEntries());
 }
 
 function formatScriptEntry(def: (typeof SCRIPTS)[number]): string {
@@ -73,7 +72,7 @@ export async function handleHelp(ctx: Context): Promise<void> {
     return;
   }
 
-  const menu = buildCommandMenu();
+  const menu = buildMenuEntries();
   const lines = [
     "🤖 <b>Commands</b>\n",
     ...menu.map((e) => `/${e.command} - ${escapeHtml(e.description)}`),
@@ -167,4 +166,76 @@ export async function handleRun(ctx: Context): Promise<void> {
 
   console.log(`/run ${scriptName} (${args.length} args) from @${username}`);
   await replyWithScriptResult(ctx, scriptName, args);
+}
+
+/**
+ * /plan - Toggle plan mode, or run a prompt in plan mode.
+ *
+ * With no arguments it toggles the session's plan-mode flag (matching the
+ * interactive CLI's /plan). With a prompt, it turns plan mode on and sends the
+ * prompt through the normal text pipeline, which then runs with
+ * permissionMode: 'plan'.
+ */
+export async function handlePlan(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+  if (!isAuthorized(userId, ALLOWED_USERS)) {
+    await ctx.reply("Unauthorized.");
+    return;
+  }
+
+  const session = getSession(ctx);
+  const prompt = typeof ctx.match === "string" ? ctx.match.trim() : "";
+
+  if (!prompt) {
+    if (session.planMode) {
+      const resolvedPending = exitPlanMode(ctx);
+      await ctx.reply(
+        resolvedPending
+          ? "✅ <b>Plan mode OFF</b>\nClaude's plan was approved, so it can execute tools now."
+          : "✅ <b>Plan mode OFF</b>\nClaude can execute tools again.",
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    session.setPlanMode(true);
+    await ctx.reply(
+      "🧭 <b>Plan mode ON</b>\nClaude will research and plan without editing files. Send /plan again or /build to exit.",
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  session.setPlanMode(true);
+  await ctx.reply("🧭 <b>Plan mode ON</b> — planning now...", {
+    parse_mode: "HTML",
+  });
+
+  // Reuse the text pipeline so streaming, rate limiting, audit logging, and
+  // retry logic all apply unchanged. Same pattern as handleRetry.
+  const { handleText } = await import("../handlers/text");
+  const fakeCtx = {
+    ...ctx,
+    message: { ...ctx.message, text: prompt },
+  } as Context;
+  await handleText(fakeCtx);
+}
+
+/**
+ * /build - Exit plan mode explicitly (Claude can execute tools again).
+ */
+export async function handleBuild(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+  if (!isAuthorized(userId, ALLOWED_USERS)) {
+    await ctx.reply("Unauthorized.");
+    return;
+  }
+
+  const resolvedPending = exitPlanMode(ctx);
+  await ctx.reply(
+    resolvedPending
+      ? "✅ <b>Plan mode OFF</b>\nClaude's plan was approved, so it can execute tools now."
+      : "✅ <b>Plan mode OFF</b>\nClaude can execute tools again.",
+    { parse_mode: "HTML" }
+  );
 }

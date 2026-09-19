@@ -33,6 +33,8 @@ export async function handleStart(ctx: Context): Promise<void> {
       `/new - Start fresh session\n` +
       `/stop - Stop current query\n` +
       `/status - Show detailed status\n` +
+      `/plan - Toggle plan mode (no edits)\n` +
+      `/build - Exit plan mode\n` +
       `/resume - Resume last session\n` +
       `/retry - Retry last message\n` +
       `/restart - Restart the bot\n\n` +
@@ -115,6 +117,9 @@ export async function handleStatus(ctx: Context): Promise<void> {
   } else {
     lines.push("⚪ Session: None");
   }
+
+  // Plan mode status
+  lines.push(session.planMode ? "🧭 Plan mode: ON" : "⚪ Plan mode: OFF");
 
   // Query status
   if (session.isRunning) {
