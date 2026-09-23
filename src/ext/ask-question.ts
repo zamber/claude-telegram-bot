@@ -44,6 +44,13 @@ export type AskProgress = {
   selected: Record<number, number[]>;
   /** question index -> user confirmed it */
   committed: Record<number, boolean>;
+  /**
+   * question index -> a free-text answer typed instead of tapping an option.
+   * Optional so callers that only ever tap keep the two-field shape. A listed
+   * option and free text are mutually exclusive for one question; free text
+   * wins when both are somehow present.
+   */
+  freeText?: Record<number, string>;
 };
 
 export function newAskProgress(): AskProgress {
@@ -159,9 +166,12 @@ function renderQuestion(
  */
 export function renderAskPrompt(questions: AskQuestion[]): string {
   const header = "❓ <b>Claude asks:</b>";
-  const hint = questions.some((question) => question.multiSelect)
+  const howTo = questions.some((question) => question.multiSelect)
     ? "Tap an option to answer. Multi-select questions need ✅ Done."
     : "Tap an option to answer.";
+  // A typed message answers the next unanswered question too (see
+  // resolvePendingText in ./permissions), so the card says so.
+  const hint = `${howTo} You can also send your own answer as a message, or reply "cancel".`;
 
   const build = (withDescriptions: boolean, maxQuestionLength: number): string => {
     const blocks = questions.map((question, index) =>
@@ -336,6 +346,11 @@ export function buildAnswers(
   const answers: Record<string, string> = {};
 
   questions.forEach((question, questionIndex) => {
+    const typed = progress.freeText?.[questionIndex];
+    if (typed) {
+      answers[question.question] = typed;
+      return;
+    }
     const labels = (progress.selected[questionIndex] ?? [])
       .map((optionIndex) => question.options[optionIndex]?.label)
       .filter((label): label is string => Boolean(label));
@@ -350,14 +365,12 @@ export function askSettleNote(
   questions: AskQuestion[],
   progress: AskProgress
 ): string {
+  const answers = buildAnswers(questions, progress);
+
   if (questions.length === 1) {
-    const labels = (progress.selected[0] ?? [])
-      .map((optionIndex) => questions[0]?.options[optionIndex]?.label)
-      .filter((label): label is string => Boolean(label));
-    return `✅ Answered: ${labels.join(", ")}`;
+    return `✅ Answered: ${answers[questions[0]!.question] ?? "—"}`;
   }
 
-  const answers = buildAnswers(questions, progress);
   return questions
     .map(
       (question, index) =>

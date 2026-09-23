@@ -36,6 +36,7 @@ import {
 import { setOnClaudeCommandsChanged } from "./ext/claude-commands";
 import { fileRunMiddleware } from "./ext/file-run-intercept";
 import { threadContextMiddleware, installThreadApiTransformer } from "./ext/thread-routing";
+import { typedAnswerMiddleware } from "./ext/typed-answer-intercept";
 import { setPermissionApi } from "./ext/permissions";
 
 // Create bot instance
@@ -51,6 +52,16 @@ setPermissionApi(bot.api);
 // set - not reliable enough on its own for forum topics to feel correct).
 installThreadApiTransformer(bot);
 bot.use(threadContextMiddleware);
+
+// Let a typed message settle an open permission gate.
+//
+// MUST stay before sequentialize(): the queue below keys ordinary text by
+// chat+topic, which is exactly the key of the gate that text is trying to
+// answer. After sequentialize the message would sit in the queue behind the
+// blocked query until the gate timed out and denied itself. On a successful
+// settle this middleware answers and does not call next(), so the message never
+// also runs as a second query.
+bot.use(typedAnswerMiddleware);
 
 // Sequentialize non-command messages per user (prevents race conditions)
 // Commands bypass sequentialization so they work immediately

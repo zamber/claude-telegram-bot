@@ -27,9 +27,11 @@ import type {
   PermissionUpdate,
 } from "@anthropic-ai/claude-agent-sdk";
 import { escapeHtml, formatToolStatus } from "../formatting";
-import { PERMISSION_TIMEOUT_MS } from "../config";
+import { PERMISSION_TIMEOUT_MS, TELEGRAM_SAFE_LIMIT } from "../config";
 import {
   applyAskTap,
+  askSettleNote,
+  buildAnswers,
   buildAskKeyboard,
   newAskProgress,
   parseAskInput,
@@ -38,6 +40,12 @@ import {
   type AskProgress,
   type AskQuestion,
 } from "./ask-question";
+import {
+  alwaysAllowLabel,
+  alwaysAllowSummary,
+  alwaysAllowUpdates,
+} from "./permission-rules";
+import { describeGate } from "./prompt-details";
 
 /**
  * Re-exported so the callback handler can validate a tap code against the ask
@@ -63,6 +71,10 @@ type Pending = {
   toolName: string;
   input: Record<string, unknown>;
   suggestions?: PermissionUpdate[];
+  /** The CLI's explanation of why it asked, shown in the prompt. */
+  decisionReason?: string;
+  /** The path the CLI rejected, when that is why it asked. */
+  blockedPath?: string;
   chatId: number;
   threadId?: number;
   messageId?: number;
@@ -78,6 +90,12 @@ type Pending = {
   createdAt: number;
   /** The exact HTML that was sent, so the settle edit can keep the context. */
   promptHtml: string;
+  /**
+   * The `updatedPermissions` an always-allow tap would submit. Computed once so
+   * the button label and the resulting rule can never disagree. Empty means the
+   * button is not offered.
+   */
+  always: PermissionUpdate[];
   /** Present only for a well-formed AskUserQuestion request. */
   ask?: { questions: AskQuestion[]; progress: AskProgress };
 };
@@ -119,6 +137,14 @@ function newRequestId(): string {
   return Date.now().toString(16).slice(-8);
 }
 
+/**
+ * One line that tells the user they may answer with a message instead of a
+ * button. Only added where a typed answer is unambiguous.
+ */
+const TYPED_ANSWER_HINT =
+  '\n\n<i>Reply "yes" to allow, or reply anything else to deny with ' +
+  "that message as the reason.</i>";
+
 function promptText(entry: Pending): string {
   // AskUserQuestion is the question itself: render it, not a tool name.
   if (entry.ask) {
@@ -129,17 +155,42 @@ function promptText(entry: Pending): string {
     return (
       "🧭 <b>Plan ready — start building?</b>\n\n" +
       "Claude finished planning and wants to leave plan mode. " +
-      "Approve to unlock file edits and commands."
+      "Approve to unlock file edits and commands." +
+      TYPED_ANSWER_HINT
     );
   }
 
-  return (
-    "🔐 <b>Permission needed</b>\n\n" +
-    formatToolStatus(entry.toolName, entry.input) +
-    "\n\n<b>Tool:</b> <code>" +
-    escapeHtml(entry.toolName) +
-    "</code>"
-  );
+  const { preview, risk } = describeGate(entry.toolName, entry.input, {
+    decisionReason: entry.decisionReason,
+    blockedPath: entry.blockedPath,
+  });
+
+  // fitPrompt drops from the end of the array backwards, so the duplicate
+  // status line goes first and the tool name plus the hint always survive.
+  const sections = [
+    "🔐 <b>Permission needed</b>",
+    preview,
+    risk ? `<blockquote>⚠️ ${escapeHtml(risk)}</blockquote>` : undefined,
+    formatToolStatus(entry.toolName, entry.input),
+    "<b>Tool:</b> <code>" + escapeHtml(entry.toolName) + "</code>" + TYPED_ANSWER_HINT,
+  ].filter((section): section is string => Boolean(section));
+
+  return fitPrompt(sections);
+}
+
+/**
+ * Join prompt sections, dropping the lowest-priority ones until the result fits
+ * Telegram's limit. The last section is never dropped, so the tool name and the
+ * typed-answer hint always survive; it is truncated instead.
+ */
+function fitPrompt(sections: string[]): string {
+  const parts = [...sections];
+  while (parts.length > 1) {
+    const joined = parts.join("\n\n");
+    if (joined.length <= TELEGRAM_SAFE_LIMIT) return joined;
+    parts.splice(parts.length - 2, 1);
+  }
+  return parts.join("\n\n").slice(0, TELEGRAM_SAFE_LIMIT);
 }
 
 function keyboard(entry: Pending): InlineKeyboardMarkup {
@@ -158,11 +209,13 @@ function keyboard(entry: Pending): InlineKeyboardMarkup {
     },
   ];
 
-  // "Always allow" replays the SDK's own suggestions as session rules, so it
-  // is only offered when the SDK actually proposed something to remember.
-  if (entry.toolName !== "ExitPlanMode" && entry.suggestions?.length) {
+  // "Always allow" is only offered when a narrow rule can be remembered - either
+  // one the CLI suggested or one synthesised from this request. The label names
+  // the rule, so the button never grants more than it says.
+  const alwaysLabel = alwaysAllowLabel(entry.always);
+  if (entry.toolName !== "ExitPlanMode" && alwaysLabel) {
     firstRow.push({
-      text: "♾️ Always",
+      text: alwaysLabel,
       callback_data: `${PERMISSION_CALLBACK_PREFIX}${entry.requestId}:w`,
     });
   }
@@ -193,11 +246,11 @@ function allowResult(entry: Pending, always: boolean): PermissionResult {
     };
   }
 
-  if (always && entry.suggestions?.length) {
+  if (always && entry.always.length) {
     return {
       behavior: "allow",
       updatedInput: entry.input,
-      updatedPermissions: entry.suggestions,
+      updatedPermissions: entry.always,
     };
   }
 
@@ -251,6 +304,10 @@ export type PermissionRequest = {
   toolName: string;
   input: Record<string, unknown>;
   suggestions?: PermissionUpdate[];
+  /** Straight from `canUseTool`'s opts, so the prompt can say why. */
+  decisionReason?: string;
+  /** Straight from `canUseTool`'s opts. */
+  blockedPath?: string;
   chatId: number;
   threadId?: number;
   signal?: AbortSignal;
@@ -293,6 +350,8 @@ export async function requestPermission(
     toolName: req.toolName,
     input: req.input,
     suggestions: req.suggestions,
+    decisionReason: req.decisionReason,
+    blockedPath: req.blockedPath,
     chatId: req.chatId,
     threadId: req.threadId,
     timer: undefined,
@@ -300,7 +359,14 @@ export async function requestPermission(
     settle: () => {},
     createdAt: Date.now(),
     promptHtml: "",
+    always: [],
   };
+
+  // Which narrow rule an always-allow tap would remember. Computed before the
+  // prompt is sent so the button label describes exactly that rule.
+  if (req.toolName !== "ExitPlanMode") {
+    entry.always = alwaysAllowUpdates(req.toolName, req.input, req.suggestions);
+  }
 
   // A well-formed AskUserQuestion becomes a real question UI. If the input does
   // not match the tool's schema, fall through to the generic Allow/Deny gate.
@@ -367,9 +433,14 @@ export async function requestPermission(
       );
       return;
     }
+    // Name the rule in the settled message, so the transcript records exactly
+    // what was remembered.
+    const alwaysSummary = alwaysAllowSummary(entry.always);
     finalize(
       allowResult(entry, decision === "always"),
-      decision === "always" ? "♾️ Always allowed" : "✅ Allowed"
+      decision === "always"
+        ? `♾️ Always allowed: ${alwaysSummary ?? entry.toolName}`
+        : "✅ Allowed"
     );
   };
 
@@ -565,4 +636,191 @@ export function resolvePendingPlanExit(sessionKey: string): boolean {
 
   console.log(`[Permission] no pending ExitPlanMode for session ${sessionKey}`);
   return false;
+}
+
+// ============== Typed answers ==============
+
+/** The oldest gate still waiting on this session, if any. */
+function findPendingForSession(sessionKey: string): Pending | undefined {
+  // Map iteration is insertion-ordered, so the oldest request is found first.
+  for (const entry of pending.values()) {
+    if (entry.sessionKey === sessionKey) return entry;
+  }
+  return undefined;
+}
+
+export type PendingTextStatus =
+  /** A plain gate was allowed. */
+  | "allowed"
+  /** A plain gate was denied, with the typed text as the reason. */
+  | "denied"
+  /** A question card was fully answered. */
+  | "answered"
+  /** One question of a card was answered; more remain. */
+  | "recorded"
+  /** A gate exists but the text cannot apply to it. */
+  | "expired";
+
+export type PendingTextResult = {
+  status: PendingTextStatus;
+  toolName: string;
+  /** 1-based, only for a question card. */
+  questionNumber?: number;
+  questionCount?: number;
+};
+
+/**
+ * Words that count as "allow" when the whole reply is one of them, lowercased
+ * and stripped of trailing punctuation. Everything else that is typed at a
+ * plain gate denies it, and the text becomes the reason Claude receives.
+ */
+const AFFIRMATIVE = new Set([
+  "yes",
+  "y",
+  "yeah",
+  "yep",
+  "ok",
+  "okay",
+  "sure",
+  "allow",
+  "approve",
+  "approved",
+  "go",
+  "si",
+  "sì",
+  "tak",
+]);
+
+/**
+ * Words that cancel a question card when they are the whole reply. Free text is
+ * otherwise taken as the answer, because the CLI accepts arbitrary text - so the
+ * user needs exactly one unambiguous way to back out.
+ */
+const CANCEL_WORDS = new Set([
+  "cancel",
+  "abort",
+  "stop",
+  "skip",
+  "never mind",
+  "nevermind",
+]);
+
+/** Longest typed denial worth forwarding to the CLI. */
+const MAX_DENY_REASON = 1000;
+
+/** Normalise a reply for whole-message comparison: case, surrounding space, trailing punctuation. */
+function normaliseReply(text: string): string {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/[.!?,;:。！？]+$/, "")
+    .trim();
+}
+
+/** Is the whole reply a yes - rather than a sentence that merely starts with one? */
+function isAffirmative(text: string): boolean {
+  return AFFIRMATIVE.has(normaliseReply(text));
+}
+
+/**
+ * Settle the oldest gate on this session with a typed message, so the user can
+ * answer a prompt without tapping a button.
+ *
+ * Returns null when no gate is waiting on this session - the caller then treats
+ * the message as ordinary input. Keyed by `sessionKey` (the same string the
+ * middleware derives from the chat and forum topic), because a typed message
+ * carries no request id.
+ */
+export function resolvePendingText(
+  sessionKey: string,
+  text: string
+): PendingTextResult | null {
+  const entry = findPendingForSession(sessionKey);
+  if (!entry) return null;
+
+  const trimmed = text.trim();
+
+  if (entry.ask) {
+    const { questions } = entry.ask;
+    const progress = entry.ask.progress;
+
+    // A bare cancel word is the one reply that must not become an answer.
+    if (CANCEL_WORDS.has(normaliseReply(trimmed))) {
+      console.log(
+        `[Permission] ask cancelled by text ${entry.requestId} tool=${entry.toolName} session=${sessionKey}`
+      );
+      entry.settle(
+        denyResult(entry, "The user declined to answer the question."),
+        "⛔ Cancelled"
+      );
+      return { status: "denied", toolName: entry.toolName };
+    }
+
+    const index = questions.findIndex(
+      (_, questionIndex) => progress.committed[questionIndex] !== true
+    );
+
+    if (index < 0) {
+      console.warn(
+        `[Permission] text for already-complete ask ${entry.requestId}; ignored`
+      );
+      return { status: "expired", toolName: entry.toolName };
+    }
+
+    const committed = { ...progress.committed, [index]: true };
+    const freeText = { ...(progress.freeText ?? {}), [index]: trimmed };
+    const next: AskProgress = {
+      selected: progress.selected,
+      committed,
+      freeText,
+    };
+    entry.ask.progress = next;
+
+    const questionNumber = index + 1;
+    const questionCount = questions.length;
+
+    if (questions.every((_, questionIndex) => committed[questionIndex] === true)) {
+      const answers = buildAnswers(questions, next);
+      console.log(
+        `[Permission] ask answered by text ${entry.requestId} tool=${
+          entry.toolName
+        } session=${sessionKey} answers=${JSON.stringify(answers)}`
+      );
+      entry.settle(
+        { behavior: "allow", updatedInput: { ...entry.input, answers } },
+        askSettleNote(questions, next)
+      );
+      return {
+        status: "answered",
+        toolName: entry.toolName,
+        questionNumber,
+        questionCount,
+      };
+    }
+
+    console.log(
+      `[Permission] ask text-answer ${entry.requestId} question=${questionNumber}/${questionCount} tool=${entry.toolName}`
+    );
+    return {
+      status: "recorded",
+      toolName: entry.toolName,
+      questionNumber,
+      questionCount,
+    };
+  }
+
+  if (isAffirmative(trimmed)) {
+    console.log(
+      `[Permission] text-allow ${entry.requestId} tool=${entry.toolName} session=${sessionKey}`
+    );
+    entry.respond("allow");
+    return { status: "allowed", toolName: entry.toolName };
+  }
+
+  const reason = trimmed.slice(0, MAX_DENY_REASON);
+  console.log(
+    `[Permission] text-deny ${entry.requestId} tool=${entry.toolName} session=${sessionKey} reason="${reason}"`
+  );
+  entry.respond("deny", reason);
+  return { status: "denied", toolName: entry.toolName };
 }
