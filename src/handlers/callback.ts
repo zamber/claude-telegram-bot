@@ -11,6 +11,8 @@ import { renameTopicToSessionTitle } from "../ext/session-title";
 import {
   DECISION_CODES,
   PERMISSION_CALLBACK_PREFIX,
+  parseAskTag,
+  resolveAskTap,
   resolvePermission,
 } from "../ext/permissions";
 import { ALLOWED_USERS } from "../config";
@@ -45,21 +47,62 @@ export async function handleCallback(ctx: Context): Promise<void> {
     return;
   }
 
-  // 3. Handle tool-permission callbacks: perm:{request_id}:{a|w|d}
-  // The pending request already edits its own message on settle, so this
-  // branch only has to settle the SDK promise and acknowledge the tap.
+  // 3. Handle tool-permission callbacks: perm:{request_id}:{code}
+  //
+  // Two families of code share the prefix:
+  //   a|w|d      - Allow / Always / Deny on the generic gate
+  //   o<Q><O>, D<Q>, x - the AskUserQuestion option keyboard (see
+  //                      ../ext/ask-question)
+  // The pending request edits its own message when it settles, so this branch
+  // only has to settle the SDK promise and acknowledge the tap.
   if (callbackData.startsWith(PERMISSION_CALLBACK_PREFIX)) {
     const permParts = callbackData.split(":");
     const requestId = permParts[1];
     const code = permParts[2];
-    const decision = code ? DECISION_CODES[code] : undefined;
 
-    if (!requestId || !decision) {
+    console.log(
+      `[Callback] perm tap requestId=${requestId ?? "-"} code=${
+        code ?? "-"
+      } user=@${username}`
+    );
+
+    if (!requestId || !code) {
       await ctx.answerCallbackQuery({ text: "Invalid permission callback" });
       return;
     }
 
-    const resolved = resolvePermission(requestId, decision);
+    const decision = DECISION_CODES[code];
+    const askTag = decision ? null : parseAskTag(code);
+
+    if (!decision && !askTag) {
+      console.warn(
+        `[Callback] perm tap with unrecognized code=${code} requestId=${requestId}`
+      );
+      await ctx.answerCallbackQuery({ text: "Invalid permission callback" });
+      return;
+    }
+
+    if (askTag) {
+      const resolved = resolveAskTap(requestId, code);
+      if (!resolved) {
+        await ctx.answerCallbackQuery({
+          text: "This request expired.",
+          show_alert: true,
+        });
+        return;
+      }
+
+      const askToasts: Record<typeof resolved.status, string> = {
+        settled: "✅ Answer sent",
+        updated: "Selected",
+        cancelled: "Cancelled",
+        invalid: "Invalid choice",
+      };
+      await ctx.answerCallbackQuery({ text: askToasts[resolved.status] });
+      return;
+    }
+
+    const resolved = resolvePermission(requestId, decision!);
     if (!resolved) {
       await ctx.answerCallbackQuery({
         text: "This request expired.",
@@ -121,9 +164,14 @@ export async function handleCallback(ctx: Context): Promise<void> {
 
   const selectedOption = requestData.options[optionIndex]!;
 
-  // 5. Update the message to show selection
+  // 5. Update the message to show selection. The explicit empty keyboard
+  // matters: Telegram keeps the existing reply_markup when an edit omits it, so
+  // without this the option buttons outlive the request and a second tap looks
+  // like the answer never arrived.
   try {
-    await ctx.editMessageText(`✓ ${selectedOption}`);
+    await ctx.editMessageText(`✓ ${selectedOption}`, {
+      reply_markup: { inline_keyboard: [] },
+    });
   } catch (error) {
     console.debug("Failed to edit callback message:", error);
   }
@@ -226,9 +274,12 @@ async function handleResumeCallback(
     return;
   }
 
-  // Update the original message to show selection
+  // Update the original message to show selection, dropping the session list
+  // keyboard so a second tap cannot target an already-resumed session.
   try {
-    await ctx.editMessageText(`✅ ${message}`);
+    await ctx.editMessageText(`✅ ${message}`, {
+      reply_markup: { inline_keyboard: [] },
+    });
   } catch (error) {
     console.debug("Failed to edit resume message:", error);
   }

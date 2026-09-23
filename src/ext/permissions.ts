@@ -11,6 +11,13 @@
  * session's chat and settles the SDK promise when the user taps a button.
  * Requests are keyed by a short random id, so several prompts (and several
  * forum topics) can be pending at the same time without colliding.
+ *
+ * Two tools carry their own UI and are handled specially:
+ *   - ExitPlanMode gets plan-specific wording.
+ *   - AskUserQuestion (see ./ask-question) is rendered as the actual question
+ *     with one button per option, and the chosen labels travel back to the CLI
+ *     inside `updatedInput.answers`. Approving it with a plain Allow button
+ *     would tell Claude "User has answered your questions: ." - an empty answer.
  */
 
 import type { Api } from "grammy";
@@ -21,6 +28,22 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 import { escapeHtml, formatToolStatus } from "../formatting";
 import { PERMISSION_TIMEOUT_MS } from "../config";
+import {
+  applyAskTap,
+  buildAskKeyboard,
+  newAskProgress,
+  parseAskInput,
+  parseAskTag,
+  renderAskPrompt,
+  type AskProgress,
+  type AskQuestion,
+} from "./ask-question";
+
+/**
+ * Re-exported so the callback handler can validate a tap code against the ask
+ * protocol while importing the whole protocol from this one module.
+ */
+export { parseAskTag };
 
 export type PermissionDecision = "allow" | "always" | "deny";
 
@@ -44,15 +67,34 @@ type Pending = {
   threadId?: number;
   messageId?: number;
   timer: ReturnType<typeof setTimeout> | undefined;
-  respond: (decision: PermissionDecision) => void;
+  respond: (decision: PermissionDecision, denyMessage?: string) => void;
+  /**
+   * The finalize closure owned by requestPermission. Stored on the entry so
+   * taps that arrive from the callback handler settle through the SAME path -
+   * one that always resolves the SDK promise.
+   */
+  settle: (result: PermissionResult, note?: string) => void;
+  /** Epoch ms the request was created - used for the settle log line. */
+  createdAt: number;
+  /** The exact HTML that was sent, so the settle edit can keep the context. */
+  promptHtml: string;
+  /** Present only for a well-formed AskUserQuestion request. */
+  ask?: { questions: AskQuestion[]; progress: AskProgress };
 };
 
 const pending = new Map<string, Pending>();
 
-let api: Api | null = null;
+/**
+ * The only Bot API methods this module calls. Narrowing the type keeps the
+ * production registration honest and lets tests pass a small fake whose
+ * argument order is still checked against grammY's real signatures.
+ */
+export type PermissionApi = Pick<Api, "sendMessage" | "editMessageText">;
+
+let api: PermissionApi | null = null;
 
 /** index.ts registers the Bot API here; this module never imports the bot. */
-export function setPermissionApi(botApi: Api): void {
+export function setPermissionApi(botApi: PermissionApi): void {
   api = botApi;
 }
 
@@ -78,6 +120,11 @@ function newRequestId(): string {
 }
 
 function promptText(entry: Pending): string {
+  // AskUserQuestion is the question itself: render it, not a tool name.
+  if (entry.ask) {
+    return renderAskPrompt(entry.ask.questions);
+  }
+
   if (entry.toolName === "ExitPlanMode") {
     return (
       "🧭 <b>Plan ready — start building?</b>\n\n" +
@@ -96,6 +143,14 @@ function promptText(entry: Pending): string {
 }
 
 function keyboard(entry: Pending): InlineKeyboardMarkup {
+  if (entry.ask) {
+    return buildAskKeyboard(
+      `${PERMISSION_CALLBACK_PREFIX}${entry.requestId}:`,
+      entry.ask.questions,
+      entry.ask.progress.selected
+    );
+  }
+
   const firstRow = [
     {
       text: "✅ Allow",
@@ -153,6 +208,44 @@ function denyResult(entry: Pending, message: string): PermissionResult {
   return { behavior: "deny", message, interrupt: false };
 }
 
+/** The settled text: the original prompt plus the outcome, escaped. */
+function settleText(entry: Pending, note: string): string {
+  return `${entry.promptHtml}\n\n${escapeHtml(note)} — <code>${escapeHtml(
+    entry.toolName
+  )}</code>`;
+}
+
+/**
+ * Rewrite the prompt message to show the outcome and DROP the inline keyboard.
+ *
+ * Telegram keeps the existing reply_markup when an edit omits it, so without
+ * the explicit empty keyboard the buttons outlive the request: the user taps
+ * again, the id is gone, and the bot answers "This request expired." - which
+ * looks like the answer never reached Claude.
+ *
+ * Best-effort only: never throws, never delays the SDK promise.
+ */
+function postSettleNote(entry: Pending, note?: string): void {
+  if (!note || entry.messageId === undefined || !api) return;
+
+  try {
+    void api
+      .editMessageText(entry.chatId, entry.messageId, settleText(entry, note), {
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [] },
+      })
+      .catch((error) =>
+        console.warn(
+          `[Permission] Failed to update prompt ${entry.requestId}: ${error}`
+        )
+      );
+  } catch (error) {
+    console.warn(
+      `[Permission] Failed to update prompt ${entry.requestId}: ${error}`
+    );
+  }
+}
+
 export type PermissionRequest = {
   sessionKey: string;
   toolName: string;
@@ -161,6 +254,8 @@ export type PermissionRequest = {
   chatId: number;
   threadId?: number;
   signal?: AbortSignal;
+  /** Test-only override; production callers use PERMISSION_TIMEOUT_MS. */
+  timeoutMs?: number;
 };
 
 /**
@@ -202,9 +297,28 @@ export async function requestPermission(
     threadId: req.threadId,
     timer: undefined,
     respond: () => {},
+    settle: () => {},
+    createdAt: Date.now(),
+    promptHtml: "",
   };
 
+  // A well-formed AskUserQuestion becomes a real question UI. If the input does
+  // not match the tool's schema, fall through to the generic Allow/Deny gate.
+  if (req.toolName === "AskUserQuestion") {
+    const parsed = parseAskInput(req.input);
+    if (parsed) {
+      entry.ask = { questions: parsed.questions, progress: newAskProgress() };
+    } else {
+      console.warn(
+        `[Permission] ${requestId} AskUserQuestion input did not match the expected shape; using the generic gate`
+      );
+    }
+  }
+
   function onAbort(): void {
+    console.warn(
+      `[Permission] abort signal for ${requestId} tool=${entry.toolName}`
+    );
     finalize(
       denyResult(entry, "Permission request was cancelled."),
       "🛑 Cancelled"
@@ -218,19 +332,37 @@ export async function requestPermission(
     pending.delete(requestId);
     req.signal?.removeEventListener("abort", onAbort);
 
-    if (note && entry.messageId !== undefined) {
-      void api
-        ?.editMessageText(entry.chatId, entry.messageId, note)
-        .catch(() => {});
-    }
+    console.log(
+      `[Permission] settle ${requestId} tool=${entry.toolName} session=${
+        entry.sessionKey
+      } outcome=${result.behavior}` +
+        (result.behavior === "deny" ? ` reason="${result.message}"` : "") +
+        ` note="${note ?? "-"}" ageMs=${Date.now() - entry.createdAt}`
+    );
 
+    // Settle the SDK promise FIRST. Nothing after this line may delay it or
+    // throw into the caller: the timer is already cleared and the entry already
+    // removed, so a throw here would strand the SDK promise forever.
     resolvePromise(result);
+
+    // Cosmetic, fire-and-forget, cannot reject unhandled.
+    postSettleNote(entry, note);
   }
 
-  entry.respond = (decision: PermissionDecision): void => {
+  // Taps that arrive later (from the callback handler) settle through this
+  // same closure, so every path resolves the SDK promise exactly once.
+  entry.settle = finalize;
+
+  entry.respond = (
+    decision: PermissionDecision,
+    denyMessage?: string
+  ): void => {
     if (decision === "deny") {
       finalize(
-        denyResult(entry, `The user denied permission for ${entry.toolName}.`),
+        denyResult(
+          entry,
+          denyMessage ?? `The user denied permission for ${entry.toolName}.`
+        ),
         "⛔ Denied"
       );
       return;
@@ -241,25 +373,42 @@ export async function requestPermission(
     );
   };
 
+  const timeoutMs = req.timeoutMs ?? PERMISSION_TIMEOUT_MS;
   entry.timer = setTimeout(() => {
+    console.warn(
+      `[Permission] timeout after ${timeoutMs}ms for ${requestId} tool=${entry.toolName} session=${entry.sessionKey}`
+    );
     finalize(
       denyResult(entry, "Permission request timed out with no answer."),
       "⌛ Timed out — denied"
     );
-  }, PERMISSION_TIMEOUT_MS);
+  }, timeoutMs);
 
   pending.set(requestId, entry);
   req.signal?.addEventListener("abort", onAbort, { once: true });
 
+  console.log(
+    `[Permission] request ${requestId} tool=${req.toolName} session=${
+      req.sessionKey
+    } chat=${req.chatId} thread=${req.threadId ?? "-"} suggestions=${
+      req.suggestions?.length ?? 0
+    }${entry.ask ? ` askQuestions=${entry.ask.questions.length}` : ""}`
+  );
+
+  entry.promptHtml = promptText(entry);
+
   try {
-    const sent = await api.sendMessage(req.chatId, promptText(entry), {
+    const sent = await api.sendMessage(req.chatId, entry.promptHtml, {
       parse_mode: "HTML",
       reply_markup: keyboard(entry),
       ...(req.threadId ? { message_thread_id: req.threadId } : {}),
     });
     entry.messageId = sent.message_id;
+    console.log(
+      `[Permission] prompt ${requestId} sent message=${sent.message_id}`
+    );
   } catch (error) {
-    console.error(`[Permission] Failed to send prompt: ${error}`);
+    console.error(`[Permission] Failed to send prompt ${requestId}: ${error}`);
     finalize(
       denyResult(entry, `Could not ask the user for permission: ${error}`)
     );
@@ -274,13 +423,128 @@ export async function requestPermission(
  */
 export function resolvePermission(
   requestId: string,
-  decision: PermissionDecision
+  decision: PermissionDecision,
+  denyMessage?: string
 ): { toolName: string; sessionKey: string } | null {
   const entry = pending.get(requestId);
-  if (!entry) return null;
+  if (!entry) {
+    console.warn(
+      `[Permission] tap for unknown request ${requestId} decision=${decision} (expired or pre-restart)`
+    );
+    return null;
+  }
+
   const { toolName, sessionKey } = entry;
-  entry.respond(decision);
+  console.log(
+    `[Permission] tap ${requestId} decision=${decision} tool=${toolName} session=${sessionKey} ageMs=${
+      Date.now() - entry.createdAt
+    }`
+  );
+  entry.respond(decision, denyMessage);
   return { toolName, sessionKey };
+}
+
+export type AskTapStatus = "invalid" | "updated" | "settled" | "cancelled";
+
+/**
+ * Apply a tap on an AskUserQuestion option keyboard.
+ *
+ * Returns null when the request id is unknown. A tap that cannot apply to the
+ * current question set returns status "invalid" and leaves the request pending.
+ */
+export function resolveAskTap(
+  requestId: string,
+  tag: string
+): { toolName: string; sessionKey: string; status: AskTapStatus } | null {
+  const entry = pending.get(requestId);
+  if (!entry) {
+    console.warn(
+      `[Permission] ask tap for unknown request ${requestId} tag=${tag} (expired or pre-restart)`
+    );
+    return null;
+  }
+
+  const base = { toolName: entry.toolName, sessionKey: entry.sessionKey };
+
+  if (!entry.ask) {
+    console.warn(
+      `[Permission] ask tap ${tag} on non-ask request ${requestId} tool=${entry.toolName}`
+    );
+    return { ...base, status: "invalid" };
+  }
+
+  const parsedTag = parseAskTag(tag);
+  if (!parsedTag) return { ...base, status: "invalid" };
+
+  const questions = entry.ask.questions;
+  const outcome = applyAskTap(questions, entry.ask.progress, parsedTag);
+  if (!outcome) return { ...base, status: "invalid" };
+
+  if (outcome.action === "cancel") {
+    console.log(
+      `[Permission] ask cancel ${requestId} tool=${entry.toolName} session=${entry.sessionKey}`
+    );
+    entry.settle(
+      denyResult(entry, "The user declined to answer the question."),
+      "⛔ Cancelled"
+    );
+    return { ...base, status: "cancelled" };
+  }
+
+  entry.ask.progress = outcome.progress;
+
+  if (outcome.action === "update") {
+    console.log(
+      `[Permission] ask select ${requestId} tag=${tag} tool=${entry.toolName}`
+    );
+    // Re-render the same message with the new toggle/marker state. No settle.
+    if (entry.messageId !== undefined && api) {
+      try {
+        void api
+          .editMessageText(
+            entry.chatId,
+            entry.messageId,
+            entry.promptHtml,
+            {
+              parse_mode: "HTML",
+              reply_markup: buildAskKeyboard(
+                `${PERMISSION_CALLBACK_PREFIX}${entry.requestId}:`,
+                questions,
+                outcome.progress.selected
+              ),
+            }
+          )
+          .catch((error) =>
+            console.warn(
+              `[Permission] Failed to update prompt ${requestId}: ${error}`
+            )
+          );
+      } catch (error) {
+        console.warn(
+          `[Permission] Failed to update prompt ${requestId}: ${error}`
+        );
+      }
+    }
+    return { ...base, status: "updated" };
+  }
+
+  // Settled: hand the chosen labels back to the CLI inside updatedInput.answers.
+  const answers = outcome.answers;
+  console.log(
+    `[Permission] ask answered ${requestId} tool=${entry.toolName} session=${
+      entry.sessionKey
+    } answers=${JSON.stringify(answers)}`
+  );
+
+  entry.settle(
+    {
+      behavior: "allow",
+      updatedInput: { ...entry.input, answers },
+    },
+    outcome.note
+  );
+
+  return { ...base, status: "settled" };
 }
 
 /**
@@ -291,9 +555,14 @@ export function resolvePermission(
 export function resolvePendingPlanExit(sessionKey: string): boolean {
   for (const entry of pending.values()) {
     if (entry.sessionKey === sessionKey && entry.toolName === "ExitPlanMode") {
+      console.log(
+        `[Permission] /build settled pending ExitPlanMode request ${entry.requestId} session=${sessionKey}`
+      );
       entry.respond("allow");
       return true;
     }
   }
+
+  console.log(`[Permission] no pending ExitPlanMode for session ${sessionKey}`);
   return false;
 }
