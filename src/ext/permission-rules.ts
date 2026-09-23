@@ -12,7 +12,12 @@
  *      combinations are stored but never consulted - so the button looks dead.
  *
  * This module synthesises a narrow rule instead, and filters suggestions down to
- * the shapes that do something:
+ * the shapes that do something. A suggestion is held to the SAME rules as a
+ * synthesised one: the CLI offers the first two words of a command as a prefix,
+ * so a gate for `sudo rm /tmp/x` arrives with `sudo rm:*` - which is refused
+ * here, not honoured.
+ *
+ * The shapes that are kept:
  *
  *   - Bash       -> `Bash(<firstWord>:*)`. The CLI treats this as a prefix, so
  *                  `ls:*` covers `ls` and `ls -la` but never `gitleaks`. A first
@@ -221,10 +226,28 @@ function isUsableSuggestion(rule: PermissionRuleValue): boolean {
     case "WebFetch":
       // The CLI requires exactly "domain:<hostname>".
       return content.startsWith("domain:") && content.length > "domain:".length;
-    case "Bash":
-      // Either an exact command (`npm run build`) or a prefix (`build:*`).
-      // Both are narrow; anything else is a shape the CLI would reject.
-      return content.endsWith(":*") ? content.length > 2 : true;
+    case "Bash": {
+      // An exact command (`npm run build`) is narrow by construction, but must
+      // still be free of shell syntax.
+      if (!content.endsWith(":*")) return !SHELL_SYNTAX.test(content);
+
+      // A prefix is only as narrow as its first word. The CLI offers the
+      // first TWO words, so a live gate for `sudo rm -rf /tmp/x` came with
+      // `sudo rm:*` - which would remember exactly the kind of command this
+      // module exists to refuse. Only a concrete executable goes through.
+      const prefix = content.slice(0, -":*".length);
+      return (
+        prefix.length > 0 &&
+        !SHELL_SYNTAX.test(prefix) &&
+        executableOf(prefix) !== null
+      );
+    }
+    case "Read":
+    case "Edit":
+      // Only the absolute directory form reads the way it looks. A rule path
+      // with ONE leading slash is relative to the project root, so any other
+      // shape could grant a directory other than the one it names.
+      return content.startsWith("//") && content.endsWith("/**");
     default:
       return true;
   }

