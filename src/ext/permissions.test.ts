@@ -8,6 +8,7 @@ import {
   requestPermission,
   resolveAskTap,
   resolvePendingPlanExit,
+  resolvePendingText,
   resolvePermission,
   setPermissionApi,
   type PermissionApi,
@@ -95,6 +96,11 @@ function lastEditMarkup(): Keyboard | undefined {
   return edits[edits.length - 1]!.options?.reply_markup;
 }
 
+/** The HTML of the prompt message at `index`. */
+function promptTextAt(index = 0): string {
+  return sent[index]!.text;
+}
+
 /** One AskUserQuestion input with `count` options. */
 function askInput(questionText = "Pick one", multiSelect = false) {
   return {
@@ -165,7 +171,7 @@ describe("requestPermission", () => {
     }
   });
 
-  test("never offers Always when the SDK proposed no suggestions", async () => {
+  test("never offers Always for a command that cannot be remembered safely", async () => {
     const promise = requestPermission({
       sessionKey: "default",
       toolName: "Bash",
@@ -174,9 +180,8 @@ describe("requestPermission", () => {
     });
     await flush();
 
-    expect(labelsOf(sent[0]!.options!.reply_markup)).not.toContain(
-      "♾️ Always"
-    );
+    const labels = labelsOf(sent[0]!.options!.reply_markup);
+    expect(labels.some((label) => label.startsWith("♾️"))).toBe(false);
 
     resolvePermission(idFromButton(sent[0]!), "deny");
     await promise;
@@ -678,5 +683,504 @@ describe("resolvePendingPlanExit", () => {
 
   test("returns false when nothing is pending", () => {
     expect(resolvePendingPlanExit("none")).toBe(false);
+  });
+});
+
+describe("always-allow rules", () => {
+  test("synthesises a narrow Bash prefix rule when the CLI suggests nothing", async () => {
+    const promise = requestPermission({
+      sessionKey: "default",
+      toolName: "Bash",
+      input: { command: "ls -la /tmp/thing" },
+      chatId: 42,
+    });
+    await flush();
+
+    expect(labelsOf(sent[0]!.options!.reply_markup)).toContain(
+      "♾️ Always: Bash(ls:*)"
+    );
+
+    resolvePermission(idFromButton(sent[0]!), "always");
+    const result = await promise;
+    expect(result.behavior).toBe("allow");
+    if (result.behavior === "allow") {
+      expect(result.updatedPermissions).toEqual([
+        {
+          type: "addRules",
+          rules: [{ toolName: "Bash", ruleContent: "ls:*" }],
+          behavior: "allow",
+          destination: "session",
+        },
+      ]);
+    }
+  });
+
+  test("replaces a whole-tool suggestion with a narrow rule", async () => {
+    // A bare rule would grant every Bash command. The gate must not offer it.
+    const promise = requestPermission({
+      sessionKey: "default",
+      toolName: "Bash",
+      input: { command: "ls -la" },
+      suggestions: [
+        {
+          type: "addRules",
+          rules: [{ toolName: "Bash" }],
+          behavior: "allow",
+          destination: "session",
+        },
+      ],
+      chatId: 42,
+    });
+    await flush();
+
+    expect(labelsOf(sent[0]!.options!.reply_markup)).toContain(
+      "♾️ Always: Bash(ls:*)"
+    );
+
+    resolvePermission(idFromButton(sent[0]!), "always");
+    const result = await promise;
+    if (result.behavior !== "allow") throw new Error("expected allow");
+    expect(result.updatedPermissions).toEqual([
+      {
+        type: "addRules",
+        rules: [{ toolName: "Bash", ruleContent: "ls:*" }],
+        behavior: "allow",
+        destination: "session",
+      },
+    ]);
+  });
+
+  test("keeps a usable suggestion instead of synthesising one", async () => {
+    const suggestion = {
+      type: "addRules" as const,
+      rules: [{ toolName: "Bash", ruleContent: "npm run build" }],
+      behavior: "allow" as const,
+      destination: "session" as const,
+    };
+    const promise = requestPermission({
+      sessionKey: "default",
+      toolName: "Bash",
+      input: { command: "npm run build" },
+      suggestions: [suggestion],
+      chatId: 42,
+    });
+    await flush();
+
+    expect(labelsOf(sent[0]!.options!.reply_markup)).toContain(
+      "♾️ Always: Bash(npm run build)"
+    );
+
+    resolvePermission(idFromButton(sent[0]!), "always");
+    await promise;
+  });
+
+  test("a WebFetch gate offers an exact hostname rule", async () => {
+    const promise = requestPermission({
+      sessionKey: "default",
+      toolName: "WebFetch",
+      input: { url: "https://example.com:8443/a/b?c=d" },
+      chatId: 42,
+    });
+    await flush();
+
+    expect(labelsOf(sent[0]!.options!.reply_markup)).toContain(
+      "♾️ Always: domain:example.com"
+    );
+
+    resolvePermission(idFromButton(sent[0]!), "always");
+    const result = await promise;
+    if (result.behavior !== "allow") throw new Error("expected allow");
+    expect(result.updatedPermissions).toEqual([
+      {
+        type: "addRules",
+        rules: [{ toolName: "WebFetch", ruleContent: "domain:example.com" }],
+        behavior: "allow",
+        destination: "session",
+      },
+    ]);
+  });
+
+  test("the settled message names the rule that was remembered", async () => {
+    const promise = requestPermission({
+      sessionKey: "default",
+      toolName: "Read",
+      input: { file_path: "/home/luna/projects/thing/file.ts" },
+      chatId: 42,
+    });
+    await flush();
+
+    resolvePermission(idFromButton(sent[0]!), "always");
+    await promise;
+
+    expect(edits[0]!.text).toContain(
+      "♾️ Always allowed: Read(//home/luna/projects/thing/**)"
+    );
+  });
+
+  test("no rule is offered for a path that cannot be scoped", async () => {
+    const promise = requestPermission({
+      sessionKey: "default",
+      toolName: "Write",
+      input: { file_path: "relative/file.ts", content: "x" },
+      chatId: 42,
+    });
+    await flush();
+
+    const labels = labelsOf(sent[0]!.options!.reply_markup);
+    expect(labels.some((label) => label.startsWith("♾️"))).toBe(false);
+    // The gate itself still works.
+    expect(labels).toContain("✅ Allow");
+
+    resolvePermission(idFromButton(sent[0]!), "allow");
+    expect((await promise).behavior).toBe("allow");
+  });
+});
+
+describe("permission prompt details", () => {
+  test("shows a Bash command in full even when a description exists", async () => {
+    const promise = requestPermission({
+      sessionKey: "default",
+      toolName: "Bash",
+      input: {
+        command: "sudo rm -rf /tmp/thing",
+        description: "Clean the temp directory",
+      },
+      chatId: 42,
+    });
+    await flush();
+
+    // formatToolStatus alone would show only "Clean the temp directory".
+    expect(sent[0]!.text).toContain("Clean the temp directory");
+    expect(sent[0]!.text).toContain("sudo rm -rf /tmp/thing");
+
+    resolvePermission(idFromButton(sent[0]!), "deny");
+    await promise;
+  });
+
+  test("quotes the safety verdict as the reason for a Bash gate", async () => {
+    const promise = requestPermission({
+      sessionKey: "default",
+      toolName: "Bash",
+      // Deliberately not "sudo rm -rf /..." - that also contains "rm -rf /",
+      // which sits earlier in BLOCKED_PATTERNS, so the reported pattern would
+      // be the one for a bare path wipe rather than the sudo attempt.
+      input: { command: "sudo rm /tmp/thing" },
+      chatId: 42,
+    });
+    await flush();
+
+    expect(sent[0]!.text).toContain("<blockquote>");
+    expect(sent[0]!.text).toContain("Blocked pattern: sudo rm");
+
+    resolvePermission(idFromButton(sent[0]!), "deny");
+    await promise;
+  });
+
+  test("shows the CLI's own reason and the blocked path", async () => {
+    const promise = requestPermission({
+      sessionKey: "default",
+      toolName: "Read",
+      input: { file_path: "/etc/shadow" },
+      decisionReason: "Path is outside the working directory",
+      blockedPath: "/etc/shadow",
+      chatId: 42,
+    });
+    await flush();
+
+    expect(sent[0]!.text).toContain("Path is outside the allowed directories");
+    expect(sent[0]!.text).toContain("/etc/shadow");
+
+    resolvePermission(idFromButton(sent[0]!), "deny");
+    await promise;
+  });
+
+  test("an Edit gate shows the file and its line counts", async () => {
+    const promise = requestPermission({
+      sessionKey: "default",
+      toolName: "Edit",
+      input: {
+        file_path: "/home/luna/notes.md",
+        old_string: "a\nb",
+        new_string: "a\nb\nc",
+      },
+      chatId: 42,
+    });
+    await flush();
+
+    expect(sent[0]!.text).toContain("<code>+3 -2</code>");
+
+    resolvePermission(idFromButton(sent[0]!), "deny");
+    await promise;
+  });
+
+  test("a hostile argument cannot break the HTML or exceed the limit", async () => {
+    const promise = requestPermission({
+      sessionKey: "default",
+      toolName: "Bash",
+      input: {
+        command: `<script>alert("x")</script> & ${"y".repeat(5000)}`,
+      },
+      chatId: 42,
+    });
+    await flush();
+
+    const text = promptTextAt();
+    expect(text).toContain("&lt;script&gt;");
+    expect(text).not.toContain("<script>");
+    expect(text.length).toBeLessThanOrEqual(4000);
+
+    resolvePermission(idFromButton(sent[0]!), "deny");
+    await promise;
+  });
+
+  test("generic gates tell the user they may reply instead of tapping", async () => {
+    const promise = requestPermission({
+      sessionKey: "default",
+      toolName: "Bash",
+      input: { command: "ls" },
+      chatId: 42,
+    });
+    await flush();
+
+    expect(promptTextAt()).toContain('Reply "yes" to allow');
+
+    resolvePermission(idFromButton(sent[0]!), "deny");
+    await promise;
+  });
+});
+
+describe("typed answers", () => {
+  test("returns null when nothing is pending for the session", () => {
+    expect(resolvePendingText("default", "yes")).toBeNull();
+  });
+
+  test("a yes-word allows the pending gate", async () => {
+    const promise = requestPermission({
+      sessionKey: "default",
+      toolName: "Bash",
+      input: { command: "ls" },
+      chatId: 42,
+    });
+    await flush();
+
+    expect(resolvePendingText("default", "  Yes. ")).toEqual({
+      status: "allowed",
+      toolName: "Bash",
+    });
+    expect((await promise).behavior).toBe("allow");
+    expect(pendingPermissionCount()).toBe(0);
+  });
+
+  test("any other reply denies and becomes the reason Claude receives", async () => {
+    const promise = requestPermission({
+      sessionKey: "default",
+      toolName: "Bash",
+      input: { command: "ls" },
+      chatId: 42,
+    });
+    await flush();
+
+    expect(resolvePendingText("default", "no, that path is wrong")).toEqual({
+      status: "denied",
+      toolName: "Bash",
+    });
+
+    const result = await promise;
+    if (result.behavior !== "deny") throw new Error("expected deny");
+    expect(result.message).toBe("no, that path is wrong");
+  });
+
+  test("a sentence that merely starts with yes still denies", async () => {
+    const promise = requestPermission({
+      sessionKey: "default",
+      toolName: "Bash",
+      input: { command: "ls" },
+      chatId: 42,
+    });
+    await flush();
+
+    resolvePendingText("default", "yes but use a different directory");
+    const result = await promise;
+    if (result.behavior !== "deny") throw new Error("expected deny");
+    expect(result.message).toBe("yes but use a different directory");
+  });
+
+  test("only the addressed session's gate is settled", async () => {
+    const mine = requestPermission({
+      sessionKey: "1:2",
+      toolName: "Bash",
+      input: { command: "ls" },
+      chatId: 42,
+      threadId: 2,
+    });
+    const theirs = requestPermission({
+      sessionKey: "1:3",
+      toolName: "Bash",
+      input: { command: "ls" },
+      chatId: 42,
+      threadId: 3,
+    });
+    await flush();
+
+    expect(resolvePendingText("1:2", "yes")).not.toBeNull();
+    expect(pendingPermissionCount()).toBe(1);
+    expect((await mine).behavior).toBe("allow");
+
+    // sent[0] was the settled one; sent[1] belongs to the other session.
+    resolvePermission(idFromButton(sent[1]!), "deny");
+    expect((await theirs).behavior).toBe("deny");
+  });
+
+  test("the oldest pending gate on a session is the one that settles", async () => {
+    const first = requestPermission({
+      sessionKey: "default",
+      toolName: "Bash",
+      input: { command: "ls" },
+      chatId: 42,
+    });
+    await flush();
+    const second = requestPermission({
+      sessionKey: "default",
+      toolName: "Bash",
+      input: { command: "pwd" },
+      chatId: 42,
+    });
+    await flush();
+
+    expect(resolvePendingText("default", "yes")).not.toBeNull();
+    expect((await first).behavior).toBe("allow");
+    expect(pendingPermissionCount()).toBe(1);
+
+    resolvePermission(idFromButton(sent[1]!), "deny");
+    expect((await second).behavior).toBe("deny");
+  });
+
+  test("free text answers a single-question card", async () => {
+    const promise = requestPermission({
+      sessionKey: "default",
+      toolName: "AskUserQuestion",
+      input: askInput("Which colour?"),
+      chatId: 42,
+    });
+    await flush();
+
+    expect(resolvePendingText("default", "teal, please")).toEqual({
+      status: "answered",
+      toolName: "AskUserQuestion",
+      questionNumber: 1,
+      questionCount: 1,
+    });
+
+    const result = await promise;
+    if (result.behavior !== "allow") throw new Error("expected allow");
+    expect(result.updatedInput.answers).toEqual({
+      "Which colour?": "teal, please",
+    });
+    expect(edits[0]!.text).toContain("✅ Answered: teal, please");
+  });
+
+  test("a bare cancel word denies a card instead of answering it", async () => {
+    const promise = requestPermission({
+      sessionKey: "default",
+      toolName: "AskUserQuestion",
+      input: askInput("Which colour?"),
+      chatId: 42,
+    });
+    await flush();
+
+    expect(resolvePendingText("default", " Cancel. ")).toEqual({
+      status: "denied",
+      toolName: "AskUserQuestion",
+    });
+
+    const result = await promise;
+    if (result.behavior !== "deny") throw new Error("expected deny");
+    expect(result.message).toBe("The user declined to answer the question.");
+    expect(edits[0]!.text).toContain("⛔ Cancelled");
+  });
+
+  test("free text that is not a cancel word becomes the answer", async () => {
+    const promise = requestPermission({
+      sessionKey: "default",
+      toolName: "AskUserQuestion",
+      input: askInput("Which colour?"),
+      chatId: 42,
+    });
+    await flush();
+
+    // "no idea" is an answer, not a refusal: the CLI accepts arbitrary text.
+    expect(resolvePendingText("default", "no idea")?.status).toBe("answered");
+
+    const result = await promise;
+    if (result.behavior !== "allow") throw new Error("expected allow");
+    expect(result.updatedInput.answers).toEqual({
+      "Which colour?": "no idea",
+    });
+  });
+
+  test("free text answers the next unanswered question of a card", async () => {
+    const promise = requestPermission({
+      sessionKey: "default",
+      toolName: "AskUserQuestion",
+      input: {
+        questions: [
+          {
+            question: "First?",
+            header: "One",
+            multiSelect: false,
+            options: [
+              { label: "A", description: "a" },
+              { label: "B", description: "b" },
+            ],
+          },
+          {
+            question: "Second?",
+            header: "Two",
+            multiSelect: false,
+            options: [
+              { label: "C", description: "c" },
+              { label: "D", description: "d" },
+            ],
+          },
+        ],
+      },
+      chatId: 42,
+    });
+    await flush();
+
+    const requestId = idFromButton(sent[0]!);
+    // Answer the first question by tapping, the second by typing.
+    expect(resolveAskTap(requestId, "o00")?.status).toBe("updated");
+
+    expect(resolvePendingText("default", "the second one")).toEqual({
+      status: "answered",
+      toolName: "AskUserQuestion",
+      questionNumber: 2,
+      questionCount: 2,
+    });
+
+    const result = await promise;
+    if (result.behavior !== "allow") throw new Error("expected allow");
+    expect(result.updatedInput.answers).toEqual({
+      "First?": "A",
+      "Second?": "the second one",
+    });
+  });
+
+  test("a typed answer on a non-ask gate never becomes an answer", async () => {
+    const promise = requestPermission({
+      sessionKey: "default",
+      toolName: "Bash",
+      input: { command: "ls" },
+      chatId: 42,
+    });
+    await flush();
+
+    // "yes" allows a plain gate, it does not answer a question.
+    expect(resolvePendingText("default", "yes")).toEqual({
+      status: "allowed",
+      toolName: "Bash",
+    });
+    expect((await promise).behavior).toBe("allow");
   });
 });

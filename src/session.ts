@@ -329,6 +329,10 @@ export class ClaudeSession {
             toolName,
             input,
             suggestions: opts.suggestions,
+            // The gate shows the user why it is asking: the CLI's own wording,
+            // plus the path it rejected when there is one.
+            decisionReason: opts.decisionReason,
+            blockedPath: opts.blockedPath,
             chatId,
             threadId,
             signal: opts.signal,
